@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Joshua-SV/chirpy_web_server/internal/auth"
+
 	"github.com/Joshua-SV/chirpy_web_server/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -47,6 +49,9 @@ func main() {
 	// set dev access good for local development
 	endpointCfig.devAccess = os.Getenv("PLATFORM")
 
+	// store secret key in memory
+	endpointCfig.key = os.Getenv("SECRET_KEY")
+
 	// specify handler that will be a static file server
 	serverMux.Handle("/app/", endpointCfig.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
 	// specify a custom handler
@@ -65,6 +70,10 @@ func main() {
 	serverMux.HandleFunc("GET /api/chirps", endpointCfig.getChirps)
 	serverMux.HandleFunc("GET /api/chirps/{chirp_id}", endpointCfig.getChirpByID)
 	serverMux.HandleFunc("POST /api/users", endpointCfig.createUser)
+	serverMux.HandleFunc("POST /api/login", endpointCfig.login)
+	serverMux.HandleFunc("POST /api/refresh", endpointCfig.refresh)
+	serverMux.HandleFunc("POST /api/revoke", endpointCfig.revokeRefreshToken)
+	serverMux.HandleFunc("PUT /api/users", endpointCfig.changeEmailAndPassword)
 
 	// create a type server
 	server := http.Server{
@@ -88,6 +97,7 @@ type apiConfig struct {
 	db             *database.Queries
 	fileserverHits atomic.Int32
 	devAccess      string
+	key            string
 }
 
 // declare struct to hold user info
@@ -96,6 +106,7 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	Password  string    `json:"password"`
 }
 
 // define struct to parse json
@@ -155,18 +166,31 @@ func (cfg *apiConfig) reset(w http.ResponseWriter, r *http.Request) {
 func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
+	// get JWT header token string
+	tokenStr, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		responseWithError(w, http.StatusUnauthorized, "no token found")
+		return
+	}
+
+	userId, err := auth.ValidateJWT(tokenStr, cfg.key)
+	if err != nil {
+		responseWithError(w, http.StatusUnauthorized, "invalid token given")
+		return
+	}
+
 	// parse the json request
 	decode := json.NewDecoder(r.Body)
 	chirp := chirp_text{}
-	err := decode.Decode(&chirp)
+	err = decode.Decode(&chirp)
 	if err != nil {
-		responseWithError(w, 500, "could not read request body")
+		responseWithError(w, http.StatusInternalServerError, "could not read request body")
 		return
 	}
 
 	// check that the message chirp is not more than 140 chars long
 	if len(chirp.Body) > 140 {
-		responseWithError(w, 400, "chirp is too long")
+		responseWithError(w, http.StatusForbidden, "chirp is too long")
 		return
 	}
 
@@ -176,12 +200,12 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 	// store chirp in database
 	params := database.CreateChirpParams{
 		Body:   chirp.Body,
-		UserID: chirp.UserID,
+		UserID: userId,
 	}
 
 	chrpRes, err := cfg.db.CreateChirp(r.Context(), params)
 	if err != nil {
-		responseWithError(w, http.StatusFailedDependency, "could not store chirp in database")
+		responseWithError(w, http.StatusInternalServerError, "could not store chirp in database")
 		return
 	}
 
@@ -189,6 +213,7 @@ func (cfg *apiConfig) createChirp(w http.ResponseWriter, r *http.Request) {
 	chirp.ID = chrpRes.ID
 	chirp.CreatedAt = chrpRes.CreatedAt
 	chirp.UpdatedAt = chrpRes.UpdatedAt
+	chirp.UserID = userId
 
 	responseWithJson(w, http.StatusCreated, chirp)
 }
@@ -244,12 +269,23 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	decode := json.NewDecoder(r.Body)
 	err := decode.Decode(&user)
 	if err != nil {
-		responseWithError(w, 500, "could not read request body")
+		responseWithError(w, http.StatusInternalServerError, "could not read request body")
 		return
 	}
 
+	hashed, err := auth.HashPassword(user.Password)
+	if err != nil {
+		responseWithError(w, http.StatusInternalServerError, "could not create password")
+		return
+	}
+
+	params := database.CreateUserParams{
+		Email:          user.Email,
+		HashedPassword: hashed,
+	}
+
 	// create user in database
-	userRes, err := cfg.db.CreateUser(r.Context(), user.Email)
+	userRes, err := cfg.db.CreateUser(r.Context(), params)
 	if err != nil {
 		responseWithError(w, 500, "could not create user in database")
 		return
@@ -260,6 +296,7 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	user.Email = userRes.Email
 	user.CreatedAt = userRes.CreatedAt
 	user.UpdatedAt = userRes.UpdatedAt
+	user.Password = ""
 
 	// respond back to client with user created information
 	w.Header().Set("Content-Type", "application/json")
@@ -313,6 +350,7 @@ func (cfg *apiConfig) getChirpByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// convert string UUID to a literal UUID
 	id, err := uuid.Parse(strID)
 	if err != nil {
 		responseWithError(w, http.StatusBadRequest, "invalid ID")
@@ -335,4 +373,158 @@ func (cfg *apiConfig) getChirpByID(w http.ResponseWriter, r *http.Request) {
 		Body:      item.Body,
 	}
 	responseWithJson(w, http.StatusOK, chirp)
+}
+
+func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	var user User
+
+	// parse the body into json
+	decode := json.NewDecoder(r.Body)
+	err := decode.Decode(&user)
+	if err != nil {
+		responseWithError(w, 500, "could not read request body")
+		return
+	}
+
+	// get user info from database
+	actualUser, err := cfg.db.GetUserByEmail(r.Context(), user.Email)
+	if err != nil {
+		responseWithError(w, http.StatusUnauthorized, "could not find user from database")
+		return
+	}
+
+	// compare passwords
+	err = auth.CheckPasswordvsHash(user.Password, actualUser.HashedPassword)
+	if err != nil {
+		responseWithError(w, http.StatusUnauthorized, "password incorrect")
+		return
+	}
+
+	// set default login session token is JWT
+	// if user.ExpireTimeSeconds <= 0 || user.ExpireTimeSeconds > 3600 {
+	// 	user.ExpireTimeSeconds = 3600
+	//}
+
+	// create the JWT token string
+	accessToken, err := auth.MakeJWT(actualUser.ID, cfg.key, time.Hour) // 1 hour expires
+	if err != nil {
+		responseWithError(w, http.StatusForbidden, "could not create token")
+		return
+	}
+
+	// create refresh token
+	refreshToken, _ := auth.MakeRefreshToken()
+	refreshExpires := time.Now().UTC().Add(60 * 24 * time.Hour)
+	params := database.CreateRefreshTokenParams{
+		Token:     refreshToken,
+		UserID:    actualUser.ID,
+		ExpiresAt: refreshExpires,
+	}
+
+	// store refresh token in database
+	_, err = cfg.db.CreateRefreshToken(r.Context(), params)
+	if err != nil {
+		responseWithError(w, http.StatusInternalServerError, "could not store refresh token")
+		return
+	}
+
+	responseWithJson(w, http.StatusOK, map[string]string{
+		"id":            actualUser.ID.String(),
+		"email":         user.Email,
+		"created_at":    actualUser.CreatedAt.String(),
+		"updated_at":    actualUser.UpdatedAt.String(),
+		"token":         accessToken,
+		"refresh_token": refreshToken,
+	})
+}
+
+func (cfg *apiConfig) refresh(w http.ResponseWriter, r *http.Request) {
+	// parse refresh token string
+	tokenStr, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		responseWithError(w, http.StatusUnauthorized, "missing refresh token")
+		return
+	}
+
+	// get user info by checking if the refresh token is still valid
+	user, err := cfg.db.GetUserFromRefreshToken(r.Context(), tokenStr)
+	if err != nil {
+		responseWithError(w, http.StatusUnauthorized, "invalid or expired refresh token")
+		return
+	}
+
+	// create new JWT token
+	jwtToken, err := auth.MakeJWT(user.ID, cfg.key, time.Hour)
+	if err != nil {
+		responseWithError(w, http.StatusInternalServerError, "could not create access token")
+		return
+	}
+
+	responseWithJson(w, http.StatusOK, map[string]string{
+		"token": jwtToken,
+	})
+}
+
+func (cfg *apiConfig) revokeRefreshToken(w http.ResponseWriter, r *http.Request) {
+	// get refresh token string
+	reToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		responseWithError(w, http.StatusUnauthorized, "missing refresh token")
+		return
+	}
+
+	// update token to be revoked
+	cfg.db.RevokeRefreshToken(r.Context(), reToken)
+
+	// assume error means that token does not exist which is the same outcome as revoked
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (cfg *apiConfig) changeEmailAndPassword(w http.ResponseWriter, r *http.Request) {
+	// get access token
+	accessToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		responseWithError(w, http.StatusUnauthorized, "missing access token")
+		return
+	}
+
+	// verify token and get user id
+	userId, err := auth.ValidateJWT(accessToken, cfg.key)
+	if err != nil {
+		responseWithError(w, http.StatusUnauthorized, "not valid access token")
+		return
+	}
+
+	defer r.Body.Close()
+
+	// get json body from request
+	var user User
+	decode := json.NewDecoder(r.Body)
+	err = decode.Decode(&user)
+	if err != nil {
+		responseWithError(w, http.StatusInternalServerError, "could not read request body")
+		return
+	}
+
+	// create new hashed password
+	hashedPass, err := auth.HashPassword(user.Password)
+	if err != nil {
+		responseWithError(w, http.StatusInternalServerError, "could not create hash")
+		return
+	}
+
+	// store new email and password in database
+	params := database.SetEmailAndPasswordParams{
+		Email:          user.Email,
+		HashedPassword: hashedPass,
+		ID:             userId,
+	}
+	err = cfg.db.SetEmailAndPassword(r.Context(), params)
+	if err != nil {
+		responseWithError(w, http.StatusInternalServerError, "could not update email and password")
+		return
+	}
+
+	responseWithJson(w, http.StatusOK, map[string]string{"email": user.Email})
 }
