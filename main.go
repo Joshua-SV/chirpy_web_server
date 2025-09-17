@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -51,6 +52,8 @@ func main() {
 
 	// store secret key in memory
 	endpointCfig.key = os.Getenv("SECRET_KEY")
+	// store polka api key
+	endpointCfig.polkaKey = os.Getenv("POLKA_KEY")
 
 	// specify handler that will be a static file server
 	serverMux.Handle("/app/", endpointCfig.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
@@ -74,6 +77,8 @@ func main() {
 	serverMux.HandleFunc("POST /api/refresh", endpointCfig.refresh)
 	serverMux.HandleFunc("POST /api/revoke", endpointCfig.revokeRefreshToken)
 	serverMux.HandleFunc("PUT /api/users", endpointCfig.changeEmailAndPassword)
+	serverMux.HandleFunc("DELETE /api/chirps/{chirpID}", endpointCfig.deleteChirpByID)
+	serverMux.HandleFunc("POST /api/polka/webhooks", endpointCfig.setUserToChirpyRed)
 
 	// create a type server
 	server := http.Server{
@@ -98,6 +103,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	devAccess      string
 	key            string
+	polkaKey       string
 }
 
 // declare struct to hold user info
@@ -107,6 +113,7 @@ type User struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
 	Password  string    `json:"password"`
+	IsRed     bool      `json:"is_chirpy_red"`
 }
 
 // define struct to parse json
@@ -116,6 +123,16 @@ type chirp_text struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Body      string    `json:"body"`
+}
+
+// structs for webhook chirpy_red membership
+type event_red struct {
+	Event string     `json:"event"`
+	Data  user_event `json:"data"`
+}
+
+type user_event struct {
+	UserID uuid.UUID `json:"user_id"`
 }
 
 // middleware function for apiconfig
@@ -297,6 +314,7 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	user.CreatedAt = userRes.CreatedAt
 	user.UpdatedAt = userRes.UpdatedAt
 	user.Password = ""
+	user.IsRed = userRes.IsChirpyRed
 
 	// respond back to client with user created information
 	w.Header().Set("Content-Type", "application/json")
@@ -429,13 +447,14 @@ func (cfg *apiConfig) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	responseWithJson(w, http.StatusOK, map[string]string{
+	responseWithJson(w, http.StatusOK, map[string]interface{}{
 		"id":            actualUser.ID.String(),
 		"email":         user.Email,
 		"created_at":    actualUser.CreatedAt.String(),
 		"updated_at":    actualUser.UpdatedAt.String(),
 		"token":         accessToken,
 		"refresh_token": refreshToken,
+		"is_chirpy_red": actualUser.IsChirpyRed,
 	})
 }
 
@@ -481,18 +500,28 @@ func (cfg *apiConfig) revokeRefreshToken(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (cfg *apiConfig) changeEmailAndPassword(w http.ResponseWriter, r *http.Request) {
+// helper function to check access token and return user uuid
+func (cfg *apiConfig) checkAccessToken(w http.ResponseWriter, r *http.Request) uuid.UUID {
 	// get access token
 	accessToken, err := auth.GetBearerToken(r.Header)
 	if err != nil {
-		responseWithError(w, http.StatusUnauthorized, "missing access token")
-		return
+		responseWithError(w, http.StatusUnauthorized, "invalid token: missing token")
+		return uuid.Nil
 	}
 
-	// verify token and get user id
-	userId, err := auth.ValidateJWT(accessToken, cfg.key)
+	// check access token
+	userID, err := auth.ValidateJWT(accessToken, cfg.key)
 	if err != nil {
-		responseWithError(w, http.StatusUnauthorized, "not valid access token")
+		responseWithError(w, http.StatusUnauthorized, "invalid token")
+		return uuid.Nil
+	}
+
+	return userID
+}
+
+func (cfg *apiConfig) changeEmailAndPassword(w http.ResponseWriter, r *http.Request) {
+	userID := cfg.checkAccessToken(w, r)
+	if userID == uuid.Nil {
 		return
 	}
 
@@ -501,7 +530,7 @@ func (cfg *apiConfig) changeEmailAndPassword(w http.ResponseWriter, r *http.Requ
 	// get json body from request
 	var user User
 	decode := json.NewDecoder(r.Body)
-	err = decode.Decode(&user)
+	err := decode.Decode(&user)
 	if err != nil {
 		responseWithError(w, http.StatusInternalServerError, "could not read request body")
 		return
@@ -518,7 +547,7 @@ func (cfg *apiConfig) changeEmailAndPassword(w http.ResponseWriter, r *http.Requ
 	params := database.SetEmailAndPasswordParams{
 		Email:          user.Email,
 		HashedPassword: hashedPass,
-		ID:             userId,
+		ID:             userID,
 	}
 	err = cfg.db.SetEmailAndPassword(r.Context(), params)
 	if err != nil {
@@ -527,4 +556,97 @@ func (cfg *apiConfig) changeEmailAndPassword(w http.ResponseWriter, r *http.Requ
 	}
 
 	responseWithJson(w, http.StatusOK, map[string]string{"email": user.Email})
+}
+
+func (cfg *apiConfig) deleteChirpByID(w http.ResponseWriter, r *http.Request) {
+	userID := cfg.checkAccessToken(w, r)
+	if userID == uuid.Nil {
+		return
+	}
+
+	// get the string UUID passed by client
+	strID := r.PathValue("chirpID")
+
+	if strID == "" {
+		responseWithError(w, http.StatusBadRequest, "No ID passed")
+		return
+	}
+
+	chirpID, err := uuid.Parse(strID)
+	if err != nil {
+		responseWithError(w, http.StatusBadRequest, "invalid ID")
+		return
+	}
+
+	// 1) Ensure chirp exists
+	item, err := cfg.db.GetChirp(r.Context(), chirpID)
+	if err != nil {
+		// Not found
+		if errors.Is(err, sql.ErrNoRows) {
+			responseWithError(w, http.StatusNotFound, "chirp not found")
+			return
+		}
+		responseWithError(w, http.StatusInternalServerError, "could not fetch chirp")
+		return
+	}
+
+	// 2) Check ownership
+	if item.UserID != userID {
+		responseWithError(w, http.StatusForbidden, "not allowed to delete this chirp")
+		return
+	}
+
+	// delete chirp based on id and user id ownership
+	err = cfg.db.DeleteChirpByID(r.Context(), chirpID)
+	if err != nil {
+		// If someone deleted it between the check and now:
+		if errors.Is(err, sql.ErrNoRows) {
+			responseWithError(w, http.StatusNotFound, "chirp not found")
+			return
+		}
+		responseWithError(w, http.StatusInternalServerError, "could not delete chirp")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// webhook function handler to give users chirpy red
+func (cfg *apiConfig) setUserToChirpyRed(w http.ResponseWriter, r *http.Request) {
+	// check webhook event had valid api key
+	apiKey, err := auth.GetAPIKey(r.Header)
+	if err != nil {
+		responseWithError(w, http.StatusUnauthorized, fmt.Sprintf("invalid api key: %v", err))
+		return
+	}
+
+	if apiKey != cfg.polkaKey {
+		responseWithError(w, http.StatusUnauthorized, "invalid api key")
+		return
+	}
+
+	defer r.Body.Close()
+	// parse json request
+	decode := json.NewDecoder(r.Body)
+	var event event_red
+	err = decode.Decode(&event)
+	if err != nil {
+		responseWithError(w, http.StatusInternalServerError, "could not read request body")
+		return
+	}
+
+	// check event is chirpy red upgrade
+	if event.Event != "user.upgraded" {
+		responseWithError(w, http.StatusNoContent, "Not valid webhook event")
+		return
+	}
+
+	// update user to chirpy red in database
+	err = cfg.db.SetUserToRed(r.Context(), event.Data.UserID)
+	if err != nil {
+		responseWithError(w, http.StatusNotFound, "user not found")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }

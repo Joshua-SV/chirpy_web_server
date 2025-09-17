@@ -81,7 +81,7 @@ VALUES (
     NOW(),
     $1,
     $2
-) RETURNING id, created_at, updated_at, email
+) RETURNING id, created_at, updated_at, email, is_chirpy_red
 `
 
 type CreateUserParams struct {
@@ -90,10 +90,11 @@ type CreateUserParams struct {
 }
 
 type CreateUserRow struct {
-	ID        uuid.UUID
-	CreatedAt time.Time
-	UpdatedAt time.Time
-	Email     string
+	ID          uuid.UUID
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	Email       string
+	IsChirpyRed bool
 }
 
 func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (CreateUserRow, error) {
@@ -104,6 +105,7 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (CreateU
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.Email,
+		&i.IsChirpyRed,
 	)
 	return i, err
 }
@@ -114,6 +116,16 @@ DELETE FROM users
 
 func (q *Queries) DeleteAllUsers(ctx context.Context) error {
 	_, err := q.db.ExecContext(ctx, deleteAllUsers)
+	return err
+}
+
+const deleteChirpByID = `-- name: DeleteChirpByID :exec
+DELETE FROM chirps
+WHERE id = $1
+`
+
+func (q *Queries) DeleteChirpByID(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.ExecContext(ctx, deleteChirpByID, id)
 	return err
 }
 
@@ -168,7 +180,7 @@ func (q *Queries) GetChirp(ctx context.Context, id uuid.UUID) (Chirp, error) {
 }
 
 const getUser = `-- name: GetUser :one
-SELECT id, created_at, updated_at, email, hashed_password FROM users WHERE id = $1
+SELECT id, created_at, updated_at, email, hashed_password, is_chirpy_red FROM users WHERE id = $1
 `
 
 func (q *Queries) GetUser(ctx context.Context, id uuid.UUID) (User, error) {
@@ -180,12 +192,13 @@ func (q *Queries) GetUser(ctx context.Context, id uuid.UUID) (User, error) {
 		&i.UpdatedAt,
 		&i.Email,
 		&i.HashedPassword,
+		&i.IsChirpyRed,
 	)
 	return i, err
 }
 
 const getUserByEmail = `-- name: GetUserByEmail :one
-SELECT id, created_at, updated_at, email, hashed_password FROM users WHERE email = $1
+SELECT id, created_at, updated_at, email, hashed_password, is_chirpy_red FROM users WHERE email = $1
 `
 
 func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error) {
@@ -197,12 +210,13 @@ func (q *Queries) GetUserByEmail(ctx context.Context, email string) (User, error
 		&i.UpdatedAt,
 		&i.Email,
 		&i.HashedPassword,
+		&i.IsChirpyRed,
 	)
 	return i, err
 }
 
 const getUserFromRefreshToken = `-- name: GetUserFromRefreshToken :one
-SELECT users.id, users.created_at, users.updated_at, users.email, users.hashed_password FROM refresh_tokens
+SELECT users.id, users.created_at, users.updated_at, users.email, users.hashed_password, users.is_chirpy_red FROM refresh_tokens
 JOIN users ON users.id = refresh_tokens.user_id
 WHERE refresh_tokens.token = $1
 AND refresh_tokens.revoked_at IS NULL
@@ -218,6 +232,7 @@ func (q *Queries) GetUserFromRefreshToken(ctx context.Context, token string) (Us
 		&i.UpdatedAt,
 		&i.Email,
 		&i.HashedPassword,
+		&i.IsChirpyRed,
 	)
 	return i, err
 }
@@ -247,5 +262,16 @@ type SetEmailAndPasswordParams struct {
 
 func (q *Queries) SetEmailAndPassword(ctx context.Context, arg SetEmailAndPasswordParams) error {
 	_, err := q.db.ExecContext(ctx, setEmailAndPassword, arg.Email, arg.HashedPassword, arg.ID)
+	return err
+}
+
+const setUserToRed = `-- name: SetUserToRed :exec
+UPDATE users
+SET is_chirpy_red = TRUE, updated_at = NOW()
+WHERE id = $1
+`
+
+func (q *Queries) SetUserToRed(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.ExecContext(ctx, setUserToRed, id)
 	return err
 }

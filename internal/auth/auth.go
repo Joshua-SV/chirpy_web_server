@@ -74,7 +74,7 @@ func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error) {
 
 // retreive the JWT token sent by the client
 func GetBearerToken(headers http.Header) (string, error) {
-	//get the value usign the key header name
+	//get the value sign the key header name
 	value := headers.Get("Authorization")
 	if value == "" {
 		return "", errors.New("Authorization header missing")
@@ -105,4 +105,27 @@ func MakeRefreshToken() (string, error) {
 	token := hex.EncodeToString(key)
 
 	return token, nil
+}
+
+// get API key from Webhook event request header
+func GetAPIKey(headers http.Header) (string, error) {
+	// get header value
+	val := headers.Get("Authorization")
+	if val == "" {
+		return "", errors.New("Authorization header missing")
+	}
+
+	// check prefix value
+	prefix := "ApiKey "
+	if !strings.HasPrefix(val, prefix) {
+		return "", errors.New("authorization header format must be 'ApiKey <token>'")
+	}
+
+	// trim prefix
+	tokenStr := strings.TrimSpace(strings.TrimPrefix(val, prefix))
+	if tokenStr == "" {
+		return "", errors.New("token missing after 'ApiKey '")
+	}
+
+	return tokenStr, nil
 }
