@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -330,14 +331,41 @@ func (cfg *apiConfig) createUser(w http.ResponseWriter, r *http.Request) {
 	w.Write(body)
 }
 
-// handler to get all chirps
+// handler to get all chirps of random users or of one particular user
 func (cfg *apiConfig) getChirps(w http.ResponseWriter, r *http.Request) {
+	// get optional user endpoint input
+	idStr := r.URL.Query().Get("author_id")
+	sortStr := r.URL.Query().Get("sort")
 
-	// get chirps from database
-	lst, err := cfg.db.GetAllChirps(r.Context())
-	if err != nil {
-		responseWithError(w, 500, "could not get chirps from database")
-		return
+	var lst []database.Chirp
+	var err error
+
+	if idStr == "" {
+		// get all chirps from database
+		lst, err = cfg.db.GetAllChirps(r.Context())
+		if err != nil {
+			responseWithError(w, http.StatusInternalServerError, "could not get chirps from database")
+			return
+		}
+	} else {
+		// convert the id string to uuid type
+		userID, err := uuid.Parse(idStr)
+		if err != nil {
+			responseWithError(w, http.StatusNotAcceptable, "user id not valid uuid")
+			return
+		}
+
+		// get all user chirps
+		lst, err = cfg.db.GetAllChirpsByUser(r.Context(), userID)
+		if err != nil {
+			responseWithError(w, http.StatusInternalServerError, "could not get chirps from database")
+			return
+		}
+	}
+
+	// sort chirps based on user input 'desc'
+	if sortStr == "desc" {
+		sort.Slice(lst, func(i, j int) bool { return lst[i].CreatedAt.After(lst[j].CreatedAt) })
 	}
 
 	// create an array to hold chirps
